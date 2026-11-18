@@ -1102,14 +1102,24 @@ class ObjectSampleV2:
         sample_2d (bool): Whether to also paste 2D image patch to the images
             This should be true when applying multi-modality cut-and-paste.
             Defaults to False.
+        update_mask_camera_on_paste (bool): For Occ3D-nuScenes, mark pasted
+            voxels of the sampled object's class for camera-masked supervision.
+            Defaults to False.
     """
+    _NUSCENES_OCC_LABELS = {
+        'barrier': 1, 'bicycle': 2, 'bus': 3, 'car': 4,
+        'construction_vehicle': 5, 'motorcycle': 6, 'pedestrian': 7,
+        'traffic_cone': 8, 'trailer': 9, 'truck': 10,
+    }
+
     def __init__(self,
                  db_sampler,
                  sample_2d=False,
                  stop_epoch=None,
                  occ_data_type=None,
                  occ_yaw_bias=0.0,
-                 debug=False):
+                 debug=False,
+                 update_mask_camera_on_paste=False):
         self.sampler_cfg = db_sampler
         self.sample_2d = sample_2d
         assert occ_data_type is not None
@@ -1117,6 +1127,11 @@ class ObjectSampleV2:
         if 'type' not in db_sampler.keys():
             db_sampler['type'] = 'DataBaseSampler'
         self.db_sampler = build_from_cfg(db_sampler, OBJECTSAMPLERS)
+        self.update_mask_camera_on_paste = update_mask_camera_on_paste
+        if update_mask_camera_on_paste and (
+                occ_data_type != 'occ3d' or
+                not set(self.db_sampler.classes).issubset(self._NUSCENES_OCC_LABELS)):
+            raise ValueError('update_mask_camera_on_paste requires Occ3D-nuScenes classes')
         self.epoch = -1
         self.stop_epoch = stop_epoch
         self.debug = debug
@@ -1168,6 +1183,9 @@ class ObjectSampleV2:
         # CORRECT PRACTICE: Use the pose of the frame where the instance/donor OBB is located
         # lidar2ego_cur = np.asarray(data["lidar2ego"], dtype=np.float32)
 
+        if self.update_mask_camera_on_paste:
+            camera_mask = data['mask_camera'].copy()
+
         for i, box in enumerate(boxes_lidar):
             occ_item = occ_items[i]
 
@@ -1187,8 +1205,18 @@ class ObjectSampleV2:
             # Write mask: only update valid labels (exclude -1)
             write_mask = (lbls != -1)
 
-            semantics_cur[ii[write_mask], jj[write_mask], kk[write_mask]] = lbls[write_mask]
+            indices = (ii[write_mask], jj[write_mask], kk[write_mask])
+            labels = lbls[write_mask]
+            semantics_cur[indices] = labels
+            if self.update_mask_camera_on_paste:
+                class_name = self.db_sampler.label2cat[sampled_dict['gt_labels_3d'][i]]
+                # For overlapping crops, follow the last semantic write at each voxel.
+                camera_mask[indices] = np.where(
+                    labels == self._NUSCENES_OCC_LABELS[class_name],
+                    1, data['mask_camera'][indices])
 
+        if self.update_mask_camera_on_paste:
+            data['mask_camera'] = camera_mask
         return semantics_cur
 
     def __call__(self, input_dict):
